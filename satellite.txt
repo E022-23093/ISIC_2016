@@ -107,14 +107,18 @@ lock2 = multiprocessing.Lock()
 
 def process(png_file):
     try:
-        # 读取PNG图像
+        # 读取PNG图像（使用imageio，不使用cv2）
         image = imageio.imread(png_file)
         
         # 如果是RGBA，转换为RGB
         if len(image.shape) == 3 and image.shape[-1] == 4:
+            # 移除alpha通道
             image = image[:, :, :3]
         elif len(image.shape) == 2:  # 灰度图
-            image = imageio.imread(png_file, pilmode='RGB')
+            # 对于灰度图，使用PIL来转换为RGB
+            from PIL import Image as PILImage
+            pil_image = PILImage.open(png_file).convert('RGB')
+            image = imageio.core.asarray(pil_image)
             
         # 从GeoJSON获取坐标信息
         filename = os.path.basename(png_file)

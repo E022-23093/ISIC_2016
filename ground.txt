@@ -3,14 +3,13 @@
 import argparse
 import os
 import json
-import cv2
 import numpy as np
 import glob
 import threading
-import shutil
-import skimage.transform
+from PIL import Image
 from collections import defaultdict
 from tqdm import tqdm
+import skimage.transform
 
 # 参数解析
 parser = argparse.ArgumentParser(description="Process existing images with Mapillary-compatible structure")
@@ -48,6 +47,10 @@ def find_image_files(directory):
         os.path.join(directory, "**/*.JPG"),
         os.path.join(directory, "**/*.JPEG"),
         os.path.join(directory, "**/*.PNG"),
+        os.path.join(directory, "**/*.bmp"),
+        os.path.join(directory, "**/*.BMP"),
+        os.path.join(directory, "**/*.tiff"),
+        os.path.join(directory, "**/*.TIFF"),
     ]
     
     files = []
@@ -58,27 +61,63 @@ def find_image_files(directory):
     files.sort()
     return files
 
-def resize_image(image_path, target_size):
-    """调整图片大小"""
+def resize_image_pil(image_path, target_size):
+    """使用PIL调整图片大小"""
     try:
         # 读取图片
-        image = cv2.imread(image_path)
-        if image is None:
-            return None, "Failed to load image"
-        
-        # 转换颜色空间 (BGR -> RGB)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        if len(image.shape) == 2:
-            return None, "Grayscale image"
-        
-        if len(image.shape) == 3 and image.shape[2] < 3:
-            return None, "Not enough color channels"
-        
-        # 确保是3通道
-        image = image[:, :, :3]
-        
-        # 调整大小 - 保持宽高比，适应目标尺寸
+        with Image.open(image_path) as img:
+            # 转换为RGB模式（处理RGBA、灰度等格式）
+            if img.mode != 'RGB':
+                if img.mode in ['RGBA', 'LA', 'P']:
+                    # 对于带透明通道或调色板的图片，先转换为RGB
+                    img = img.convert('RGB')
+                elif img.mode in ['L', '1']:
+                    # 灰度图转RGB
+                    return None, "Grayscale image"
+                else:
+                    img = img.convert('RGB')
+            
+            # 获取原始尺寸
+            original_width, original_height = img.size
+            
+            # 计算缩放比例（保持宽高比）
+            target_height, target_width = target_size
+            scale_w = target_width / original_width
+            scale_h = target_height / original_height
+            scale = min(scale_w, scale_h)
+            
+            # 计算新的尺寸
+            new_width = int(original_width * scale)
+            new_height = int(original_height * scale)
+            
+            # 调整大小
+            img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            
+            # 转换为numpy数组
+            image_array = np.array(img_resized)
+            
+            return image_array, "success"
+            
+    except Exception as e:
+        return None, str(e)
+
+def resize_image_skimage(image_path, target_size):
+    """使用skimage调整图片大小（备用方法）"""
+    try:
+        # 使用PIL读取，然后用skimage处理
+        with Image.open(image_path) as img:
+            if img.mode != 'RGB':
+                if img.mode in ['RGBA', 'LA', 'P']:
+                    img = img.convert('RGB')
+                elif img.mode in ['L', '1']:
+                    return None, "Grayscale image"
+                else:
+                    img = img.convert('RGB')
+            
+            # 转换为numpy数组
+            image = np.array(img)
+            
+        # 使用skimage调整大小
         shape_in = np.asarray(image.shape[:2])
         shape_out = np.asarray(target_size)
         factor = np.amin(shape_out.astype("float") / shape_in) + 1e-6
@@ -103,11 +142,32 @@ def resize_image(image_path, target_size):
     except Exception as e:
         return None, str(e)
 
-def process_image(image_idx, image_path, output_path, target_size, folders_lock):
+def save_image_pil(image_array, output_path, quality=95):
+    """使用PIL保存图片"""
+    try:
+        # 确保数组是正确的格式
+        if image_array.dtype != np.uint8:
+            image_array = np.clip(image_array, 0, 255).astype(np.uint8)
+        
+        # 转换为PIL Image
+        img = Image.fromarray(image_array, 'RGB')
+        
+        # 保存为JPEG
+        img.save(output_path, 'JPEG', quality=quality, optimize=True)
+        return True
+        
+    except Exception as e:
+        print(f"Error saving image: {e}")
+        return False
+
+def process_image(image_idx, image_path, output_path, target_size, folders_lock, use_skimage=False):
     """处理单个图片"""
     try:
-        # 调整图片大小
-        resized_image, msg = resize_image(image_path, target_size)
+        # 选择调整大小的方法
+        if use_skimage:
+            resized_image, msg = resize_image_skimage(image_path, target_size)
+        else:
+            resized_image, msg = resize_image_pil(image_path, target_size)
         
         if resized_image is None:
             return msg, None
@@ -126,24 +186,26 @@ def process_image(image_idx, image_path, output_path, target_size, folders_lock)
                 if not os.path.exists(directory):
                     os.makedirs(directory, exist_ok=True)
         
-        # 保存调整后的图片 (转换回BGR用于OpenCV保存)
-        image_bgr = cv2.cvtColor(resized_image, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(output_file + f"-{target_size[0]}.jpg", image_bgr)
+        # 保存调整后的图片
+        image_output_path = output_file + f"-{target_size[0]}.jpg"
+        if not save_image_pil(resized_image, image_output_path):
+            return "failed to save image", None
         
         # 创建元数据
-        # 从文件名尝试提取一些信息
         basename = os.path.basename(image_path)
         sequence_id = image_idx // args.sequence_size
         
         metadata = {
-            "timestamp": image_idx,  # 使用索引作为时间戳
-            "latlon": [0.0, 0.0],  # 默认位置
+            "timestamp": image_idx,
+            "latlon": [0.0, 0.0],
             "sequence": f"sequence_{sequence_id:06d}",
             "camera-type": "perspective",
             "image-id": image_idx,
             "creator": "processed",
             "original_path": image_path,
             "original_filename": basename,
+            "original_size": [args.existing_height, args.existing_width],
+            "processed_size": list(target_size)
         }
         
         with open(output_file + ".json", "w") as f:
@@ -193,16 +255,20 @@ def process_existing_images():
                 image_path, 
                 args.path, 
                 target_size, 
-                folders_lock
+                folders_lock,
+                False  # 默认使用PIL方法
             )
             futures.append(future)
         
         # 收集结果
         for future in tqdm(futures, desc="Processing images"):
-            msg, data = future.result()
-            results[msg] += 1
-            if msg == "success" and data is not None:
-                successes.append(data)
+            try:
+                msg, data = future.result()
+                results[msg] += 1
+                if msg == "success" and data is not None:
+                    successes.append(data)
+            except Exception as e:
+                results[f"thread_error: {str(e)}"] += 1
     
     print("Processing results:")
     for k, v in results.items():

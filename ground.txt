@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import json
+import cv2
+import numpy as np
+import glob
+import threading
+import shutil
+import skimage.transform
+from collections import defaultdict
+from tqdm import tqdm
+
+# 参数解析
+parser = argparse.ArgumentParser(description="Process existing images with Mapillary-compatible structure")
+parser.add_argument("--path", type=str, required=True, 
+                   help="Output path for processed dataset")
+parser.add_argument("--existing-images-path", type=str, required=True,
+                   help="Path to existing images directory")
+parser.add_argument("--width", type=int, required=True,
+                   help="Target width for processed images")
+parser.add_argument("--height", type=int, required=True,
+                   help="Target height for processed images")
+parser.add_argument("--existing-width", type=int, default=512,
+                   help="Width of existing images (default: 512)")
+parser.add_argument("--existing-height", type=int, default=1024,
+                   help="Height of existing images (default: 1024)")
+parser.add_argument("--workers", type=int, default=8,
+                   help="Number of worker threads for processing")
+parser.add_argument("--sequence-size", type=int, default=100,
+                   help="Number of images per virtual sequence (default: 100)")
+
+args = parser.parse_args()
+
+print(f"Processing existing images from: {args.existing_images_path}")
+print(f"Existing image size: {args.existing_height}x{args.existing_width}")
+print(f"Target size: {args.height}x{args.width}")
+print(f"Output path: {args.path}")
+print(f"Workers: {args.workers}")
+
+def find_image_files(directory):
+    """递归查找所有图片文件"""
+    image_patterns = [
+        os.path.join(directory, "**/*.jpg"),
+        os.path.join(directory, "**/*.jpeg"),
+        os.path.join(directory, "**/*.png"),
+        os.path.join(directory, "**/*.JPG"),
+        os.path.join(directory, "**/*.JPEG"),
+        os.path.join(directory, "**/*.PNG"),
+    ]
+    
+    files = []
+    for pattern in image_patterns:
+        files.extend(glob.glob(pattern, recursive=True))
+    
+    # 按文件名排序以保证处理顺序的一致性
+    files.sort()
+    return files
+
+def resize_image(image_path, target_size):
+    """调整图片大小"""
+    try:
+        # 读取图片
+        image = cv2.imread(image_path)
+        if image is None:
+            return None, "Failed to load image"
+        
+        # 转换颜色空间 (BGR -> RGB)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        if len(image.shape) == 2:
+            return None, "Grayscale image"
+        
+        if len(image.shape) == 3 and image.shape[2] < 3:
+            return None, "Not enough color channels"
+        
+        # 确保是3通道
+        image = image[:, :, :3]
+        
+        # 调整大小 - 保持宽高比，适应目标尺寸
+        shape_in = np.asarray(image.shape[:2])
+        shape_out = np.asarray(target_size)
+        factor = np.amin(shape_out.astype("float") / shape_in) + 1e-6
+        shape_resized = (shape_in * factor).astype("int")
+        
+        # 确保不超过目标尺寸
+        shape_resized = np.minimum(shape_resized, shape_out)
+        
+        dtype = image.dtype
+        image_resized = skimage.transform.resize(
+            image.astype("float32"), 
+            shape_resized, 
+            order=1, 
+            mode="constant", 
+            preserve_range=True, 
+            anti_aliasing=True
+        )
+        image_resized = image_resized.astype(dtype)
+        
+        return image_resized, "success"
+        
+    except Exception as e:
+        return None, str(e)
+
+def process_image(image_idx, image_path, output_path, target_size, folders_lock):
+    """处理单个图片"""
+    try:
+        # 调整图片大小
+        resized_image, msg = resize_image(image_path, target_size)
+        
+        if resized_image is None:
+            return msg, None
+        
+        # 生成输出文件路径
+        images_directory_levels = max(len(str(len(glob.glob(os.path.join(args.existing_images_path, "**/*"), recursive=True)))) - 2, 0)
+        file = f"{image_idx:012}"[::-1]
+        for i in reversed(range(images_directory_levels)):
+            file = file[:i + 1] + "/" + file[i + 1:]
+        output_file = os.path.join(output_path, "images", file)
+        
+        # 创建目录
+        directory = os.path.dirname(output_file)
+        if not os.path.exists(directory):
+            with folders_lock:
+                if not os.path.exists(directory):
+                    os.makedirs(directory, exist_ok=True)
+        
+        # 保存调整后的图片 (转换回BGR用于OpenCV保存)
+        image_bgr = cv2.cvtColor(resized_image, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(output_file + f"-{target_size[0]}.jpg", image_bgr)
+        
+        # 创建元数据
+        # 从文件名尝试提取一些信息
+        basename = os.path.basename(image_path)
+        sequence_id = image_idx // args.sequence_size
+        
+        metadata = {
+            "timestamp": image_idx,  # 使用索引作为时间戳
+            "latlon": [0.0, 0.0],  # 默认位置
+            "sequence": f"sequence_{sequence_id:06d}",
+            "camera-type": "perspective",
+            "image-id": image_idx,
+            "creator": "processed",
+            "original_path": image_path,
+            "original_filename": basename,
+        }
+        
+        with open(output_file + ".json", "w") as f:
+            json.dump(metadata, f, indent=2)
+        
+        # 返回成功信息
+        sequence_name = metadata["sequence"]
+        timestamp = metadata["timestamp"]
+        latlon = np.array(metadata["latlon"])
+        
+        return "success", (sequence_name, timestamp, image_idx, latlon)
+        
+    except Exception as e:
+        return f"error: {str(e)}", None
+
+def process_existing_images():
+    """处理已存在的图片"""
+    # 查找所有图片文件
+    existing_files = find_image_files(args.existing_images_path)
+    
+    if len(existing_files) == 0:
+        print("No image files found in the specified directory")
+        return [], 0
+    
+    print(f"Found {len(existing_files)} image files")
+    
+    # 创建输出目录
+    output_images_path = os.path.join(args.path, "images")
+    os.makedirs(output_images_path, exist_ok=True)
+    
+    # 多线程处理
+    from concurrent.futures import ThreadPoolExecutor
+    
+    folders_lock = threading.Lock()
+    results = defaultdict(lambda: 0)
+    successes = []
+    
+    target_size = [args.height, args.width]
+    
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        # 提交所有任务
+        futures = []
+        for image_idx, image_path in enumerate(existing_files):
+            future = executor.submit(
+                process_image, 
+                image_idx, 
+                image_path, 
+                args.path, 
+                target_size, 
+                folders_lock
+            )
+            futures.append(future)
+        
+        # 收集结果
+        for future in tqdm(futures, desc="Processing images"):
+            msg, data = future.result()
+            results[msg] += 1
+            if msg == "success" and data is not None:
+                successes.append(data)
+    
+    print("Processing results:")
+    for k, v in results.items():
+        print(f"   {k}: {v}")
+    
+    images_directory_levels = max(len(str(len(existing_files))) - 2, 0)
+    return successes, images_directory_levels
+
+def create_dataset_structure(successes, images_directory_levels):
+    """创建数据集结构和元数据"""
+    if len(successes) == 0:
+        print("No images were successfully processed")
+        return
+    
+    print("Creating dataset structure...")
+    
+    # 按序列分组
+    sequences = defaultdict(list)
+    for sequence_name, timestamp, image_idx, latlon in successes:
+        sequences[sequence_name].append((timestamp, image_idx, latlon))
+    
+    images_num = len(successes)
+    print(f"Processed {images_num} images in {len(sequences)} sequences")
+    
+    # 保存序列元数据
+    seq_directory_levels = max(len(str(len(sequences))) - 2, 0)
+    sequences_path = os.path.join(args.path, "sequences")
+    os.makedirs(sequences_path, exist_ok=True)
+    
+    image_seqidx = np.zeros(images_num, dtype="int32") - 1
+    
+    for sequence_idx, (sequence_name, sequence) in enumerate(tqdm(sorted(sequences.items()), desc="Saving sequence metadata")):
+        sequence = sorted(sequence)
+        timestamps = [x[0] for x in sequence]
+        image_indices = [x[1] for x in sequence]
+        latlons = [x[2] for x in sequence]
+        
+        # 更新图片到序列的映射
+        for img_idx in image_indices:
+            if img_idx < len(image_seqidx):
+                image_seqidx[img_idx] = sequence_idx
+        
+        # 生成序列文件路径
+        file = f"{sequence_idx:012}"[::-1]
+        for i in reversed(range(seq_directory_levels)):
+            file = file[:i + 1] + "/" + file[i + 1:]
+        file_path = os.path.join(sequences_path, file)
+        
+        directory = os.path.dirname(file_path)
+        os.makedirs(directory, exist_ok=True)
+        
+        # 序列元数据
+        metadata = {
+            "name": sequence_name,
+            "t0": timestamps[0] if timestamps else 0,
+            "duration": (timestamps[-1] - timestamps[0]) if len(timestamps) > 1 else 0,
+            "latlon0": latlons[0].tolist() if latlons else [0.0, 0.0],
+            "image-indices": image_indices,
+            "images-count": len(image_indices)
+        }
+        
+        with open(file_path + ".json", "w") as f:
+            json.dump(metadata, f, indent=2)
+    
+    # 保存序列索引映射
+    np.savez_compressed(os.path.join(args.path, "sequence-idxs.npz"), sequence_idxs=image_seqidx)
+    
+    # 保存图片元数据汇总
+    latlons = np.zeros([images_num, 2], dtype="float64")
+    timestamps = np.zeros([images_num], dtype="uint64")
+    
+    # 从各个图片的JSON文件读取数据
+    for _, timestamp, image_idx, latlon in tqdm(successes, desc="Collecting image metadata"):
+        if image_idx < len(latlons):
+            latlons[image_idx] = latlon
+            timestamps[image_idx] = timestamp
+    
+    np.savez_compressed(os.path.join(args.path, "latlons.npz"), latlons=latlons)
+    np.savez_compressed(os.path.join(args.path, "timestamps.npz"), timestamps=timestamps)
+    
+    # 数据集总体元数据
+    dataset_metadata = {
+        "images-num": images_num,
+        "images-directory-levels": images_directory_levels,
+        "sequences-num": len(sequences),
+        "sequences-directory-levels": seq_directory_levels,
+        "orig-resolution": [args.height, args.width],
+        "source-resolution": [args.existing_height, args.existing_width],
+        "processed-from-existing": True,
+        "source-path": args.existing_images_path
+    }
+    
+    with open(os.path.join(args.path, "dataset.json"), "w") as f:
+        json.dump(dataset_metadata, f, indent=2)
+    
+    # 创建许可证文件
+    with open(os.path.join(args.path, "LICENSE"), "w") as f:
+        f.write("Processed from existing images. Original license may apply.")
+    
+    print(f"Dataset created successfully!")
+    print(f"- {images_num} images processed")
+    print(f"- {len(sequences)} sequences created") 
+    print(f"- Output directory: {args.path}")
+
+def main():
+    """主函数"""
+    # 验证输入
+    if not os.path.exists(args.existing_images_path):
+        raise ValueError(f"Existing images path does not exist: {args.existing_images_path}")
+    
+    # 创建输出目录
+    os.makedirs(args.path, exist_ok=True)
+    
+    # 处理图片
+    successes, images_directory_levels = process_existing_images()
+    
+    # 创建数据集结构
+    create_dataset_structure(successes, images_directory_levels)
+    
+    print("Processing completed!")
+
+if __name__ == "__main__":
+    main()

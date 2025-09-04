@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+
+import os
+import json
+import yaml
+from PIL import Image
+import pandas as pd
+import numpy as np
+
+class TileReader:
+    def __init__(self, tiles_path):
+        self.tiles_path = tiles_path
+        self.layout_config = None
+        self.processing_report = None
+        self.tile_to_image_map = {}
+        
+        # 加载配置文件
+        self.load_config()
+        
+    def load_config(self):
+        """加载配置文件"""
+        # 加载layout.yaml
+        layout_path = os.path.join(self.tiles_path, "layout.yaml")
+        if os.path.exists(layout_path):
+            with open(layout_path, 'r') as f:
+                self.layout_config = yaml.safe_load(f)
+        
+        # 加载处理报告
+        report_path = os.path.join(self.tiles_path, "processing_report.json")
+        if os.path.exists(report_path):
+            with open(report_path, 'r', encoding='utf-8') as f:
+                self.processing_report = json.load(f)
+    
+    def get_all_tiles(self, zoom_level=0):
+        """获取指定缩放级别的所有瓦片信息"""
+        tiles = []
+        zoom_dir = os.path.join(self.tiles_path, str(zoom_level))
+        
+        if not os.path.exists(zoom_dir):
+            return tiles
+        
+        for x_name in os.listdir(zoom_dir):
+            x_path = os.path.join(zoom_dir, x_name)
+            if not os.path.isdir(x_path):
+                continue
+                
+            try:
+                x = int(x_name)
+            except ValueError:
+                continue
+            
+            for y_file in os.listdir(x_path):
+                if not y_file.endswith('.jpg'):
+                    continue
+                
+                try:
+                    y = int(y_file.replace('.jpg', ''))
+                except ValueError:
+                    continue
+                
+                tile_path = os.path.join(x_path, y_file)
+                
+                # 获取瓦片文件信息
+                if os.path.exists(tile_path):
+                    tile_info = {
+                        'x': x,
+                        'y': y,
+                        'zoom': zoom_level,
+                        'path': tile_path,
+                        'file_size': os.path.getsize(tile_path)
+                    }
+                    
+                    # 如果可能，添加图片尺寸
+                    try:
+                        with Image.open(tile_path) as img:
+                            tile_info['width'], tile_info['height'] = img.size
+                    except:
+                        pass
+                    
+                    tiles.append(tile_info)
+        
+        return sorted(tiles, key=lambda t: (t['x'], t['y']))
+    
+    def get_image_locations(self):
+        """获取所有图片的位置信息"""
+        locations = []
+        
+        if not self.processing_report:
+            print("警告: 未找到processing_report.json文件")
+            return locations
+        
+        successful_images = self.processing_report.get('successful_images', {})
+        
+        for image_id, image_info in successful_images.items():
+            # 从原始GeoJSON数据中查找位置信息
+            # 这需要重新读取GeoJSON文件或从report中获取
+            location_info = {
+                'image_id': image_id,
+                'tiles_count': image_info.get('tiles_count', 0),
+                'tile_size': image_info.get('tile_size', 0),
+                'original_size': image_info.get('original_size', [0, 0]),
+                'has_geo_info': image_info.get('has_geo_info', False)
+            }
+            
+            locations.append(location_info)
+        
+        return locations
+    
+    def reconstruct_image_positions_from_geojson(self, geojson_path):
+        """从原始GeoJSON重新构建图片位置信息"""
+        if not os.path.exists(geojson_path):
+            print(f"GeoJSON文件不存在: {geojson_path}")
+            return {}
+        
+        with open(geojson_path, 'r', encoding='utf-8') as f:
+            geojson_data = json.load(f)
+        
+        positions = {}
+        for feature in geojson_data['features']:
+            properties = feature.get('properties', {})
+            image_id = str(properties.get('id', ''))
+            
+            if image_id and feature.get('geometry', {}).get('type') == 'Point':
+                lon, lat = feature['geometry']['coordinates']
+                positions[image_id] = {
+                    'image_id': image_id,
+                    'longitude': lon,
+                    'latitude': lat,
+                    'properties': properties
+                }
+        
+        return positions
+    
+    def get_complete_image_info(self, geojson_path=None):
+        """获取完整的图片信息（包括位置）"""
+        image_locations = self.get_image_locations()
+        
+        # 如果提供了GeoJSON路径，添加位置信息
+        if geojson_path:
+            geo_positions = self.reconstruct_image_positions_from_geojson(geojson_path)
+            
+            for img_info in image_locations:
+                image_id = img_info['image_id']
+                if image_id in geo_positions:
+                    img_info.update(geo_positions[image_id])
+        
+        return image_locations
+    
+    def export_to_csv(self, output_path, geojson_path=None):
+        """导出图片信息到CSV文件"""
+        image_info = self.get_complete_image_info(geojson_path)
+        
+        if not image_info:
+            print("没有找到图片信息")
+            return
+        
+        df = pd.DataFrame(image_info)
+        df.to_csv(output_path, index=False, encoding='utf-8')
+        print(f"图片信息已导出到: {output_path}")
+        return df
+    
+    def export_to_geojson(self, output_path, geojson_path=None):
+        """导出为GeoJSON格式"""
+        image_info = self.get_complete_image_info(geojson_path)
+        
+        features = []
+        for img in image_info:
+            if 'longitude' in img and 'latitude' in img:
+                feature = {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [img['longitude'], img['latitude']]
+                    },
+                    "properties": {
+                        "image_id": img['image_id'],
+                        "tiles_count": img.get('tiles_count', 0),
+                        "tile_size": img.get('tile_size', 0),
+                        "original_width": img.get('original_size', [0, 0])[0],
+                        "original_height": img.get('original_size', [0, 0])[1],
+                        **img.get('properties', {})
+                    }
+                }
+                features.append(feature)
+        
+        geojson_output = {
+            "type": "FeatureCollection",
+            "features": features
+        }
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(geojson_output, f, indent=2, ensure_ascii=False)
+        
+        print(f"GeoJSON已导出到: {output_path}")
+        return geojson_output
+    
+    def get_tile_coverage(self, zoom_level=0):
+        """获取瓦片覆盖范围统计"""
+        tiles = self.get_all_tiles(zoom_level)
+        
+        if not tiles:
+            return {}
+        
+        x_coords = [t['x'] for t in tiles]
+        y_coords = [t['y'] for t in tiles]
+        
+        coverage = {
+            'total_tiles': len(tiles),
+            'x_range': [min(x_coords), max(x_coords)],
+            'y_range': [min(y_coords), max(y_coords)],
+            'zoom_level': zoom_level
+        }
+        
+        return coverage
+    
+    def print_summary(self):
+        """打印瓦片文件夹摘要信息"""
+        print(f"瓦片文件夹: {self.tiles_path}")
+        print("=" * 50)
+        
+        # 基本配置信息
+        if self.layout_config:
+            print("布局配置:")
+            print(f"  坐标系: {self.layout_config.get('crs', 'Unknown')}")
+            print(f"  瓦片尺寸: {self.layout_config.get('tile_shape_px', 'Unknown')}")
+        
+        # 处理报告信息
+        if self.processing_report:
+            summary = self.processing_report.get('processing_summary', {})
+            print(f"\n处理统计:")
+            print(f"  总图片数: {summary.get('total_images', 0)}")
+            print(f"  成功处理: {summary.get('successful', 0)}")
+            print(f"  处理失败: {summary.get('failed', 0)}")
+            print(f"  总瓦片数: {summary.get('total_tiles', 0)}")
+        
+        # 瓦片覆盖信息
+        coverage = self.get_tile_coverage()
+        if coverage:
+            print(f"\n瓦片覆盖 (zoom 0):")
+            print(f"  瓦片总数: {coverage['total_tiles']}")
+            print(f"  X范围: {coverage['x_range'][0]} - {coverage['x_range'][1]}")
+            print(f"  Y范围: {coverage['y_range'][0]} - {coverage['y_range'][1]}")
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="读取瓦片文件夹中的图片位置信息")
+    parser.add_argument("--tiles_path", type=str, required=True, help="瓦片文件夹路径")
+    parser.add_argument("--geojson", type=str, help="原始GeoJSON文件路径（用于获取位置信息）")
+    parser.add_argument("--export_csv", type=str, help="导出CSV文件路径")
+    parser.add_argument("--export_geojson", type=str, help="导出GeoJSON文件路径")
+    parser.add_argument("--summary", action='store_true', help="显示摘要信息")
+    
+    args = parser.parse_args()
+    
+    # 创建读取器
+    reader = TileReader(args.tiles_path)
+    
+    # 显示摘要
+    if args.summary:
+        reader.print_summary()
+    
+    # 导出CSV
+    if args.export_csv:
+        df = reader.export_to_csv(args.export_csv, args.geojson)
+        if df is not None:
+            print(f"\nCSV预览:")
+            print(df.head())
+    
+    # 导出GeoJSON
+    if args.export_geojson:
+        reader.export_to_geojson(args.export_geojson, args.geojson)
+    
+    # 如果没有指定任何操作，默认显示摘要
+    if not any([args.export_csv, args.export_geojson, args.summary]):
+        reader.print_summary()
+        
+        # 获取图片信息
+        if args.geojson:
+            image_info = reader.get_complete_image_info(args.geojson)
+            print(f"\n找到 {len(image_info)} 个图片的信息")
+            if image_info:
+                print("\n前5个图片信息:")
+                for i, img in enumerate(image_info[:5]):
+                    print(f"{i+1}. ID: {img['image_id']}")
+                    if 'center_lon' in img:
+                        print(f"   中心位置: ({img['center_lon']:.6f}, {img['center_lat']:.6f})")
+                        if img.get('geometry_type') == 'Polygon':
+                            print(f"   几何类型: 多边形")
+                            print(f"   边界框: ({img['bounds']['min_lon']:.6f}, {img['bounds']['min_lat']:.6f}) - ({img['bounds']['max_lon']:.6f}, {img['bounds']['max_lat']:.6f})")
+                            print(f"   覆盖范围: {img['width_deg']:.6f}° × {img['height_deg']:.6f}°")
+                            if 'coordinates' in img:
+                                print(f"   四个角坐标:")
+                                for j, coord in enumerate(img['coordinates'][:4]):
+                                    print(f"     角{j+1}: ({coord[0]:.6f}, {coord[1]:.6f})")
+                        else:
+                            print(f"   几何类型: 点")
+                    print(f"   瓦片数: {img.get('tiles_count', 0)}")
+                    print("   ---")
+
+if __name__ == "__main__":
+    main()

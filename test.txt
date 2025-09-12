@@ -1,0 +1,36 @@
+def split_transformer_equally(transformer, num_gpus=2):
+    """平均分配 transformer blocks 到 GPU"""
+    
+    # 获取所有 transformer blocks
+    blocks = []
+    other_modules = {}
+    
+    for name, module in transformer.named_children():
+        if 'blocks' in name or 'transformer_blocks' in name:
+            # 获取所有 blocks
+            for i in range(len(module)):
+                blocks.append(f"{name}.{i}")
+        else:
+            other_modules[name] = 0  # 其他模块到 GPU 0
+    
+    # 平均分配 blocks
+    device_map = other_modules.copy()
+    blocks_per_gpu = len(blocks) // num_gpus
+    
+    for i, block_name in enumerate(blocks):
+        gpu_id = min(i // blocks_per_gpu, num_gpus - 1)
+        device_map[block_name] = gpu_id
+    
+    print(f"Device map created: {len(device_map)} modules")
+    print(f"GPU 0: {sum(1 for v in device_map.values() if v == 0)} modules")
+    print(f"GPU 1: {sum(1 for v in device_map.values() if v == 1)} modules")
+    
+    return device_map
+
+# 使用
+device_map = split_transformer_equally(pipeline.transformer)
+pipeline.transformer = dispatch_model(
+    pipeline.transformer, 
+    device_map,
+    main_device=0  # 指定主设备
+)
